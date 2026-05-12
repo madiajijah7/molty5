@@ -150,6 +150,12 @@ class Heartbeat:
         # Load memory (if enabled)
         if ENABLE_MEMORY:
             await self.memory.load()
+            # Try to restore from Railway snapshot (survives container restarts)
+            from bot.utils.railway_sync import restore_memory_from_railway
+
+            restored = await restore_memory_from_railway(self.memory)
+            if restored:
+                await self.memory.save()
             if creds.get("agent_name"):
                 self.memory.set_agent_name(creds["agent_name"])
         else:
@@ -166,8 +172,8 @@ class Heartbeat:
                 self.running = False
             except Exception as e:
                 consecutive_errors += 1
-                # Escalating backoff: 10s → 30s → 60s → 120s
-                wait = min(10 * (2 ** min(consecutive_errors - 1, 4)), 120)
+                # Escalating backoff: 5s → 10s → 20s → 40s → 60s
+                wait = min(5 * (2 ** min(consecutive_errors - 1, 4)), 60)
                 log.error(
                     "Heartbeat error (#%d): %s. Retrying in %ds...",
                     consecutive_errors,
@@ -225,8 +231,20 @@ class Heartbeat:
 
         # Step 3: Route based on state
         if state == NO_IDENTITY:
-            # Always try to register identity (ERC-8004) — whether
-            # HAVE_ACCOUNT=yes or no. AUTO_IDENTITY must be true.
+            # Anti-loop: if identity setup completed but server still
+            # reports NO_IDENTITY, after 3 cycles skip setup and go
+            # directly to free room join (server verifies on /ws/join anyway).
+            no_id_cycles = getattr(self, "_no_identity_cycles", 0)
+            if no_id_cycles >= 3:
+                log.warning(
+                    "NO_IDENTITY persists after %d setup cycles — bypassing, "
+                    "trying free room join directly...",
+                    no_id_cycles,
+                )
+                self._no_identity_cycles = 0
+                await self._handle_ready(me, READY_FREE)
+                return
+
             log.info(
                 "NO_IDENTITY for [%s] — attempting identity registration...",
                 self._agent_name,
@@ -243,7 +261,15 @@ class Heartbeat:
             return
 
     async def _handle_no_identity(self, me: dict):
-        """Setup pipeline: wallet → whitelist → identity. Respects config flags."""
+        """Setup pipeline: wallet → whitelist → identity. Respects config flags.
+
+        On success, bypasses the state router and directly proceeds to READY_FREE
+        to avoid infinite loop where server /api/identity reports success but
+        /accounts/me still shows erc8004Id=null (server-side on-chain re-verify).
+        """
+        # Anti-loop: track consecutive NO_IDENTITY cycles
+        self._no_identity_cycles = getattr(self, "_no_identity_cycles", 0) + 1
+
         # Use per-agent config first, fallback to credentials file
         if self.agent_config:
             owner_eoa = self.agent_config.get("owner_eoa", "")
@@ -294,7 +320,14 @@ class Heartbeat:
         else:
             log.info("Identity auto-registration skipped (AUTO_IDENTITY=false)")
 
+        self._no_identity_cycles = 0  # Reset on success
         log.info("✅ Full setup complete!")
+
+        # After successful setup, skip re-checking state and go straight
+        # to READY_FREE. The /accounts/me endpoint may not reflect the
+        # identity registration immediately (server re-verifies on-chain).
+        log.info("Bypassing state re-check — proceeding directly to READY_FREE...")
+        await self._handle_ready(me, READY_FREE)
 
     async def _handle_ready(self, me: dict, state: str):
         """Join a game based on room selection."""
@@ -305,6 +338,11 @@ class Heartbeat:
                 game_id, agent_id = await join_paid_game(self.api)
             else:
                 game_id, agent_id = await join_free_game(self.api)
+
+            if not game_id or not agent_id:
+                # Queue exhausted or rate limited — retry next cycle
+                log.info("Join returned empty — retrying next cycle...")
+                return
         except APIError as e:
             if e.code == "NO_IDENTITY":
                 log.error("Identity required. Will setup next cycle.")
@@ -384,5 +422,10 @@ class Heartbeat:
         # Settle
         await settle_game(game_result, entry_type, self.memory)
 
-        log.info("Game complete. Starting next cycle in 5s...")
-        await asyncio.sleep(5)
+        # Sync memory to Railway so data survives container restarts
+        from bot.utils.railway_sync import sync_memory_to_railway
+
+        await sync_memory_to_railway(self.memory.data)
+
+        log.info("Game complete. Starting next cycle in 2s...")
+        await asyncio.sleep(2)
